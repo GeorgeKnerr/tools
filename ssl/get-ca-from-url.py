@@ -5,35 +5,86 @@
 import sys
 import socket
 import ssl
-import certifi
 from urllib.parse import urlparse
 import os
-import warnings
+import subprocess
+import tempfile
 
-def extract_server_certificate(hostname, port=443):
+def get_cert_chain_using_openssl(hostname, port=443):
     """
-    Extract the server's certificate chain from an SSL connection
+    Use openssl command line tool to get the full certificate chain
     
     Args:
         hostname (str): The hostname to connect to
         port (int): The port to connect to (default 443)
         
     Returns:
-        str: PEM formatted certificate chain
+        list: List of certificates in PEM format
     """
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-
-    with socket.create_connection((hostname, port)) as sock:
-        with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-            cert_binary = ssock.getpeercert(binary_form=True)
-            if not cert_binary:
-                raise ValueError("No certificate received from server")
+    try:
+        # Use openssl s_client to get the full chain
+        cmd = [
+            'openssl', 's_client',
+            '-connect', f'{hostname}:{port}',
+            '-showcerts',
+            '-servername', hostname
+        ]
+        
+        # Create a temporary file for the certificates
+        with tempfile.NamedTemporaryFile(mode='w+b') as f:
+            # Write a newline to stdin to complete the connection
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(input=b'\n')
             
-            # Convert to PEM format
-            cert_pem = ssl.DER_cert_to_PEM_cert(cert_binary)
-            return cert_pem
+            if process.returncode != 0:
+                raise ValueError(f"OpenSSL error: {stderr.decode()}")
+            
+            # Parse the output to extract certificates
+            certs = []
+            current_cert = []
+            stdout = stdout.decode('utf-8')
+            
+            in_cert = False
+            for line in stdout.split('\n'):
+                if '-----BEGIN CERTIFICATE-----' in line:
+                    in_cert = True
+                    current_cert = [line]
+                elif '-----END CERTIFICATE-----' in line:
+                    in_cert = False
+                    current_cert.append(line)
+                    certs.append('\n'.join(current_cert))
+                elif in_cert:
+                    current_cert.append(line)
+            
+            if not certs:
+                raise ValueError("No certificates found in the chain")
+                
+            # Print information about each certificate
+            print(f"\nFound {len(certs)} certificates in the chain:")
+            for i, cert in enumerate(certs):
+                # Use openssl to get certificate details
+                with tempfile.NamedTemporaryFile(mode='w') as cert_file:
+                    cert_file.write(cert)
+                    cert_file.flush()
+                    
+                    cmd = ['openssl', 'x509', '-in', cert_file.name, '-noout', '-subject', '-issuer']
+                    process = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    print(f"\nCertificate {i+1}:")
+                    print(process.stdout.strip())
+            
+            # Return the root CA certificate (last in chain)
+            return certs[-1]
+            
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"OpenSSL command failed: {e}")
+    except Exception as e:
+        raise ValueError(f"Error getting certificate chain: {e}")
 
 def save_certificate(cert_pem, output_path):
     """
@@ -68,29 +119,24 @@ def main():
         if not hostname:
             raise ValueError("Invalid hostname")
 
-        # Get the certificate
         print(f"Connecting to {hostname}...")
-        cert_pem = extract_server_certificate(hostname)
+        
+        # Get the CA certificate (last in chain)
+        ca_cert = get_cert_chain_using_openssl(hostname)
         
         # Save the certificate
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cert_path = os.path.join(script_dir, "ca.pem")
-        save_certificate(cert_pem, cert_path)
+        save_certificate(ca_cert, cert_path)
         
-        print(f"Successfully saved server certificate to: {cert_path}")
+        print(f"\nSuccessfully saved root CA certificate to: {cert_path}")
         return 0
 
-    except (socket.gaierror, ConnectionRefusedError) as e:
-        print(f"Connection error: {e}")
-        return 1
-    except ssl.SSLError as e:
-        print(f"SSL error: {e}")
-        return 1
     except ValueError as e:
         print(f"Error: {e}")
         return 1
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Unexpected error: {str(e)}")
         return 1
 
 if __name__ == "__main__":
